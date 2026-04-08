@@ -13,7 +13,7 @@ import socket
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -44,6 +44,7 @@ IMAGE_MAX_ATTEMPTS = 3
 METADATA_BACKOFFS = (2.0, 4.0, 8.0)
 IMAGE_BACKOFFS = (2.0, 5.0)
 MAX_IMAGE_REDIRECTS = 3
+STALE_RUNNING_SYNC_THRESHOLD = timedelta(hours=6)
 DEFAULT_ALLOWED_IMAGE_HOSTS = ("data.moa.gov.tw", "www.pet.gov.tw", "asms.coa.gov.tw")
 DENIED_IP_NETWORKS = (
     ipaddress.ip_network("100.64.0.0/10"),
@@ -319,6 +320,7 @@ def sync():
     init_db()
 
     conn = get_connection()
+    mark_stale_running_syncs(conn)
     published_version = get_current_published_version(conn)
     dataset_version = generate_dataset_version()
     stage_dir = dataset_image_dir(dataset_version)
@@ -352,13 +354,14 @@ def sync():
                 cleanup_dataset_version(conn, dataset_version)
                 return
 
-            removed_count = record_removed_cats(
+            pending_removals = collect_removed_cats(
                 conn,
                 dataset_version,
                 published_version,
                 counts["api_ids"],
                 run_id,
             )
+            removed_count = len(pending_removals)
             update_sync_run(
                 run_id,
                 records_upserted=counts["added"] + counts["updated"],
@@ -375,6 +378,7 @@ def sync():
 
             publish_dataset(conn, dataset_version)
             published_switched = True
+            record_removed_cats(conn, pending_removals)
             prune_datasets(conn, keep_versions={dataset_version})
             finalize_sync_run(
                 run_id,
@@ -598,15 +602,15 @@ def queue_image_fetch(conn: sqlite3.Connection, dataset_version: str, animal_id:
     )
 
 
-def record_removed_cats(
+def collect_removed_cats(
     conn: sqlite3.Connection,
     dataset_version: str,
     published_version: str | None,
     api_ids: set[int],
     run_id: int,
-) -> int:
+) -> list[tuple]:
     if not published_version:
-        return 0
+        return []
 
     existing_rows = conn.execute(
         "SELECT * FROM dataset_cats WHERE dataset_version = ?",
@@ -614,20 +618,14 @@ def record_removed_cats(
     ).fetchall()
     removed_rows = [row for row in existing_rows if row["animal_id"] not in api_ids]
     if not removed_rows:
-        return 0
+        return []
 
     removed_at = utc_now()
+    pending_rows: list[tuple] = []
     for row in removed_rows:
         snapshot = dict(row)
         snapshot["replacement_dataset_version"] = dataset_version
-        conn.execute(
-            """
-            INSERT INTO cat_removals (
-                animal_id, removed_at, detected_in_run_id, last_seen_at,
-                last_known_animal_update, last_known_album_update,
-                last_known_album_url, snapshot_json, removal_reason
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+        pending_rows.append(
             (
                 row["animal_id"],
                 removed_at,
@@ -638,12 +636,27 @@ def record_removed_cats(
                 row["source_album_url"],
                 json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
                 "missing_from_upstream_snapshot",
-            ),
+            )
         )
 
+    return pending_rows
+
+
+def record_removed_cats(conn: sqlite3.Connection, pending_rows: list[tuple]):
+    if not pending_rows:
+        return
+
+    conn.executemany(
+        """
+        INSERT INTO cat_removals (
+            animal_id, removed_at, detected_in_run_id, last_seen_at,
+            last_known_animal_update, last_known_album_update,
+            last_known_album_url, snapshot_json, removal_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        pending_rows,
+    )
     conn.commit()
-    log.info("Recorded %d removed animals for new dataset %s", len(removed_rows), dataset_version)
-    return len(removed_rows)
 
 
 def sync_images(
@@ -911,6 +924,22 @@ def generate_dataset_version() -> str:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def mark_stale_running_syncs(conn: sqlite3.Connection):
+    stale_before = (datetime.now(timezone.utc) - STALE_RUNNING_SYNC_THRESHOLD).isoformat()
+    conn.execute(
+        """
+        UPDATE sync_runs
+        SET status = 'failed',
+            finished_at = COALESCE(finished_at, ?),
+            error_summary = COALESCE(error_summary, 'Marked failed after stale running sync timeout')
+        WHERE status = 'running'
+          AND started_at < ?
+        """,
+        (utc_now(), stale_before),
+    )
+    conn.commit()
 
 
 def _safe_int(value) -> int | None:
