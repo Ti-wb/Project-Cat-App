@@ -424,6 +424,9 @@ def stage_cats(
             invalid_records += 1
             continue
         api_ids.add(animal_id)
+        staged_row = get_staged_cat(conn, dataset_version, animal_id)
+        if staged_row:
+            clear_staged_cat(conn, dataset_version, animal_id)
 
         published_row = get_published_cat(conn, published_version, animal_id)
         local_image = None
@@ -526,6 +529,36 @@ def get_published_cat(
         """,
         (published_version, animal_id),
     ).fetchone()
+
+
+def get_staged_cat(
+    conn: sqlite3.Connection, dataset_version: str, animal_id: int
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM dataset_cats
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (dataset_version, animal_id),
+    ).fetchone()
+
+
+def clear_staged_cat(conn: sqlite3.Connection, dataset_version: str, animal_id: int):
+    conn.execute(
+        """
+        DELETE FROM dataset_image_fetch_state
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (dataset_version, animal_id),
+    )
+    conn.execute(
+        """
+        DELETE FROM dataset_cats
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (dataset_version, animal_id),
+    )
 
 
 def can_reuse_published_image(published_row: sqlite3.Row | None, record: dict) -> bool:
