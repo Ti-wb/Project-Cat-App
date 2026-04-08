@@ -29,4 +29,38 @@ docker compose up -d api nginx
 
 echo "✅ Deploy done!"
 echo ""
-curl -s http://localhost:8900/health | python3 -m json.tool
+
+HEALTH_URL="http://localhost:8900/health"
+HEALTH_TIMEOUT_SECONDS=30
+HEALTH_BACKOFF_SECONDS=1
+HEALTH_MAX_BACKOFF_SECONDS=5
+HEALTH_DEADLINE=$((SECONDS + HEALTH_TIMEOUT_SECONDS))
+
+while true; do
+  health_response="$(mktemp)"
+
+  if curl --fail --silent --show-error "$HEALTH_URL" > "$health_response"; then
+    if python3 -m json.tool < "$health_response"; then
+      rm -f "$health_response"
+      exit 0
+    fi
+    echo "Health probe returned invalid JSON, retrying..."
+  else
+    echo "Health probe failed, retrying..."
+  fi
+
+  rm -f "$health_response"
+
+  if (( SECONDS >= HEALTH_DEADLINE )); then
+    echo "ERROR: health probe did not succeed within ${HEALTH_TIMEOUT_SECONDS}s: $HEALTH_URL" >&2
+    exit 1
+  fi
+
+  sleep "$HEALTH_BACKOFF_SECONDS"
+  if (( HEALTH_BACKOFF_SECONDS < HEALTH_MAX_BACKOFF_SECONDS )); then
+    HEALTH_BACKOFF_SECONDS=$((HEALTH_BACKOFF_SECONDS * 2))
+    if (( HEALTH_BACKOFF_SECONDS > HEALTH_MAX_BACKOFF_SECONDS )); then
+      HEALTH_BACKOFF_SECONDS=$HEALTH_MAX_BACKOFF_SECONDS
+    fi
+  fi
+done
