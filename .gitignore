@@ -1,4 +1,6 @@
 # Data
+data/
+backend/data/
 backend/data/cats.db
 backend/data/images/*.png
 backend/data/images/*.jpg

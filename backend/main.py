@@ -1,15 +1,14 @@
 """
 main.py - FastAPI backend for Taiwan public shelter cat adoption app.
 """
-import os
 import sqlite3
-from typing import Optional, List
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import get_connection, init_db
-from models import CatBrief, CatDetail, ShelterInfo, CatListResponse
+from database import get_connection, get_current_published_version, init_db
+from models import CatBrief, CatDetail, CatListResponse, ShelterInfo
 
 app = FastAPI(title="Cat Adoption API", version="1.0.0")
 
@@ -26,22 +25,26 @@ def startup():
     init_db()
 
 
-def _image_url(animal_id: int, local_image: Optional[str]) -> Optional[str]:
+def _image_url(dataset_version: str, animal_id: int, local_image: Optional[str]) -> Optional[str]:
     if local_image:
-        return f"/images/{animal_id}.png"
+        return f"/images/{dataset_version}/{animal_id}.png"
     return None
 
 
 def _row_to_brief(row: sqlite3.Row) -> CatBrief:
     d = dict(row)
-    d["image_url"] = _image_url(d["animal_id"], d.get("local_image"))
+    d["image_url"] = _image_url(d["dataset_version"], d["animal_id"], d.get("local_image"))
     return CatBrief(**d)
 
 
 def _row_to_detail(row: sqlite3.Row) -> CatDetail:
     d = dict(row)
-    d["image_url"] = _image_url(d["animal_id"], d.get("local_image"))
+    d["image_url"] = _image_url(d["dataset_version"], d["animal_id"], d.get("local_image"))
     return CatDetail(**d)
+
+
+def _published_version(conn: sqlite3.Connection) -> str | None:
+    return get_current_published_version(conn)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -49,9 +52,20 @@ def _row_to_detail(row: sqlite3.Row) -> CatDetail:
 @app.get("/health")
 def health():
     conn = get_connection()
-    count = conn.execute("SELECT COUNT(*) FROM cats").fetchone()[0]
+    published_version = _published_version(conn)
+    if published_version:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM dataset_cats WHERE dataset_version = ?",
+            (published_version,),
+        ).fetchone()[0]
+    else:
+        count = 0
     conn.close()
-    return {"status": "ok", "cats_count": count}
+    return {
+        "status": "ok",
+        "cats_count": count,
+        "published_version": published_version,
+    }
 
 
 @app.get("/api/cats", response_model=CatListResponse)
@@ -69,9 +83,13 @@ def list_cats(
     offset: int = Query(0, ge=0),
 ):
     conn = get_connection()
+    published_version = _published_version(conn)
+    if not published_version:
+        conn.close()
+        return CatListResponse(total=0, items=[], offset=offset, limit=limit)
 
-    conditions: list[str] = []
-    params: list = []
+    conditions = ["dataset_version = ?"]
+    params: list = [published_version]
 
     if shelter:
         conditions.append("shelter_name = ?")
@@ -104,13 +122,19 @@ def list_cats(
         like = f"%{q}%"
         params.extend([like, like, like])
 
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    where = "WHERE " + " AND ".join(conditions)
 
-    total_row = conn.execute(f"SELECT COUNT(*) FROM cats {where}", params).fetchone()
+    total_row = conn.execute(f"SELECT COUNT(*) FROM dataset_cats {where}", params).fetchone()
     total = total_row[0]
 
     rows = conn.execute(
-        f"SELECT * FROM cats {where} ORDER BY animal_id DESC LIMIT ? OFFSET ?",
+        f"""
+        SELECT *
+        FROM dataset_cats
+        {where}
+        ORDER BY animal_id DESC
+        LIMIT ? OFFSET ?
+        """,
         params + [limit, offset],
     ).fetchall()
     conn.close()
@@ -122,7 +146,19 @@ def list_cats(
 @app.get("/api/cats/{animal_id}", response_model=CatDetail)
 def get_cat(animal_id: int):
     conn = get_connection()
-    row = conn.execute("SELECT * FROM cats WHERE animal_id = ?", (animal_id,)).fetchone()
+    published_version = _published_version(conn)
+    if not published_version:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Cat not found")
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM dataset_cats
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (published_version, animal_id),
+    ).fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail="Cat not found")
@@ -132,14 +168,21 @@ def get_cat(animal_id: int):
 @app.get("/api/shelters", response_model=List[ShelterInfo])
 def list_shelters():
     conn = get_connection()
+    published_version = _published_version(conn)
+    if not published_version:
+        conn.close()
+        return []
+
     rows = conn.execute(
         """
         SELECT shelter_name, shelter_address, shelter_tel, area_pkid,
-               COUNT(*) as count
-        FROM cats
+               COUNT(*) AS count
+        FROM dataset_cats
+        WHERE dataset_version = ?
         GROUP BY shelter_name, shelter_address, shelter_tel, area_pkid
         ORDER BY shelter_name
-        """
+        """,
+        (published_version,),
     ).fetchall()
     conn.close()
     return [ShelterInfo(**dict(r)) for r in rows]
@@ -148,10 +191,28 @@ def list_shelters():
 @app.get("/api/filters")
 def get_filters():
     conn = get_connection()
+    published_version = _published_version(conn)
+    if not published_version:
+        conn.close()
+        return {
+            "colours": [],
+            "ages": [],
+            "sexes": [],
+            "bodytypes": [],
+            "sterilizations": [],
+        }
 
     def distinct(col: str) -> list[str]:
         rows = conn.execute(
-            f"SELECT DISTINCT {col} FROM cats WHERE {col} IS NOT NULL AND {col} != '' ORDER BY {col}"
+            f"""
+            SELECT DISTINCT {col}
+            FROM dataset_cats
+            WHERE dataset_version = ?
+              AND {col} IS NOT NULL
+              AND {col} != ''
+            ORDER BY {col}
+            """,
+            (published_version,),
         ).fetchall()
         return [r[0] for r in rows]
 
