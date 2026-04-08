@@ -448,11 +448,26 @@ def queue_image_refresh(conn: sqlite3.Connection, animal_id: int, source_url: st
         ) VALUES (?, ?, NULL, NULL, 0, NULL, NULL, 'pending')
         ON CONFLICT(animal_id) DO UPDATE SET
             source_url_hash=excluded.source_url_hash,
-            last_success_at=NULL,
-            failure_count=0,
-            last_error_code=NULL,
-            next_eligible_at=NULL,
-            status='pending'
+            last_success_at=CASE
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                ELSE image_fetch_state.last_success_at
+            END,
+            failure_count=CASE
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN 0
+                ELSE image_fetch_state.failure_count
+            END,
+            last_error_code=CASE
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                ELSE image_fetch_state.last_error_code
+            END,
+            next_eligible_at=CASE
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                ELSE image_fetch_state.next_eligible_at
+            END,
+            status=CASE
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN 'pending'
+                ELSE image_fetch_state.status
+            END
         """,
         (animal_id, source_url_hash),
     )
