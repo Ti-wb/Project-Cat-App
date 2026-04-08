@@ -3,15 +3,18 @@ sync.py - Sync cat data from Taiwan government API to local SQLite database.
 Usage: python sync.py
 """
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import random
 import sqlite3
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -34,6 +37,12 @@ METADATA_BACKOFFS = (2.0, 4.0, 8.0)
 IMAGE_BACKOFFS = (2.0, 5.0)
 IMAGE_FAILURE_COOLDOWN = 6 * 60 * 60
 MAX_IMAGES_PER_RUN = 200
+MAX_IMAGE_REDIRECTS = 3
+DEFAULT_ALLOWED_IMAGE_HOSTS = ("data.moa.gov.tw", "www.pet.gov.tw", "asms.coa.gov.tw")
+DENIED_IP_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("198.18.0.0/15"),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +61,7 @@ class SyncConfig:
     request_timeout: int = REQUEST_TIMEOUT
     image_failure_cooldown: int = IMAGE_FAILURE_COOLDOWN
     max_images_per_run: int = MAX_IMAGES_PER_RUN
+    max_image_redirects: int = MAX_IMAGE_REDIRECTS
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,10 @@ class DownloadResult:
     outcome: str
     error_code: str | None = None
     content: bytes | None = None
+
+
+class UnsafeImageUrlError(RuntimeError):
+    pass
 
 
 class RateLimiter:
@@ -103,7 +117,9 @@ class UpstreamClient:
         for attempt in range(1, self.config.image_max_attempts + 1):
             self.limiter.wait("image")
             try:
-                response = self.client.get(url, timeout=self.config.request_timeout)
+                response = self._get_validated_image(url)
+            except UnsafeImageUrlError as exc:
+                return DownloadResult(outcome="terminal_failure", error_code=str(exc))
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 error_code = exc.__class__.__name__
                 if attempt >= self.config.image_max_attempts:
@@ -163,6 +179,8 @@ class UpstreamClient:
                 )
                 continue
 
+            if 300 <= response.status_code < 400:
+                response.raise_for_status()
             if response.status_code < 400:
                 return response
             if not self._is_retryable_status(response.status_code):
@@ -207,6 +225,63 @@ class UpstreamClient:
     def _is_retryable_status(status_code: int) -> bool:
         return status_code == 429 or status_code in (500, 502, 503, 504)
 
+    def _get_validated_image(self, url: str) -> httpx.Response:
+        current_url = self._validate_image_url(url)
+        for _ in range(self.config.max_image_redirects + 1):
+            response = self.client.get(current_url, timeout=self.config.request_timeout)
+            if response.status_code not in (301, 302, 303, 307, 308):
+                return response
+            location = response.headers.get("Location")
+            if not location:
+                return response
+            current_url = self._validate_image_url(urljoin(str(current_url), location))
+        raise UnsafeImageUrlError("REDIRECT_LIMIT_EXCEEDED")
+
+    def _validate_image_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise UnsafeImageUrlError("INVALID_URL_SCHEME")
+        if not parsed.hostname:
+            raise UnsafeImageUrlError("MISSING_URL_HOST")
+        hostname = parsed.hostname.rstrip(".").lower()
+        if not self._is_allowed_image_host(hostname):
+            raise UnsafeImageUrlError("DISALLOWED_IMAGE_HOST")
+        self._ensure_public_host(hostname, parsed.port, parsed.scheme)
+        return parsed.geturl()
+
+    @staticmethod
+    def _is_allowed_image_host(hostname: str) -> bool:
+        configured_hosts = os.getenv("IMAGE_HOST_ALLOWLIST")
+        if configured_hosts:
+            allowed_hosts = tuple(
+                host.strip().lower() for host in configured_hosts.split(",") if host.strip()
+            )
+        else:
+            allowed_hosts = DEFAULT_ALLOWED_IMAGE_HOSTS
+        return any(hostname == host or hostname.endswith(f".{host}") for host in allowed_hosts)
+
+    @staticmethod
+    def _ensure_public_host(hostname: str, port: int | None, scheme: str):
+        resolve_port = port or (443 if scheme == "https" else 80)
+        try:
+            addrinfos = socket.getaddrinfo(hostname, resolve_port, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise UnsafeImageUrlError("HOST_RESOLUTION_FAILED") from exc
+
+        for family, _, _, _, sockaddr in addrinfos:
+            raw_ip = sockaddr[0]
+            ip = ipaddress.ip_address(raw_ip)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+                or any(ip in network for network in DENIED_IP_NETWORKS)
+            ):
+                raise UnsafeImageUrlError("DISALLOWED_IMAGE_IP")
+
 
 def fetch_all_cats(upstream: UpstreamClient, run_id: int) -> list[dict]:
     records: list[dict] = []
@@ -243,7 +318,7 @@ def sync():
     run_id = create_sync_run(conn)
 
     try:
-        with httpx.Client(headers=headers, follow_redirects=True) as client:
+        with httpx.Client(headers=headers, follow_redirects=False) as client:
             upstream = UpstreamClient(client=client, limiter=limiter, config=config)
             log.info("Fetching data from government API ...")
             records = fetch_all_cats(upstream, run_id)
@@ -272,7 +347,6 @@ def sync():
 
             image_stats = sync_images(conn, upstream, config, run_id)
             finalize_sync_run(
-                conn,
                 run_id,
                 status=run_status,
                 error_summary=error_summary,
@@ -291,7 +365,12 @@ def sync():
                 image_stats["failed"],
             )
     except Exception as exc:
-        finalize_sync_run(conn, run_id, status="failed", error_summary=str(exc))
+        conn.rollback()
+        finalize_sync_run(
+            run_id,
+            status="failed",
+            error_summary=str(exc),
+        )
         raise
     finally:
         conn.close()
@@ -342,8 +421,16 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
 
         existing = conn.execute(
             """
-            SELECT animal_id, local_image, first_seen_at, album_file, source_album_update
-            FROM cats WHERE animal_id = ?
+            SELECT
+                c.animal_id,
+                c.local_image,
+                c.first_seen_at,
+                c.album_file,
+                c.source_album_update,
+                s.status AS image_status
+            FROM cats c
+            LEFT JOIN image_fetch_state s ON s.animal_id = c.animal_id
+            WHERE c.animal_id = ?
             """,
             (animal_id,),
         ).fetchone()
@@ -536,6 +623,8 @@ def should_force_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
     if existing is None:
         return False
     local_image = row["local_image"]
+    if not local_image and existing["image_status"] == "success":
+        return True
     if local_image and not (IMAGE_DIR / local_image).exists():
         return True
     if existing["album_file"] != row["album_file"]:
@@ -728,7 +817,6 @@ def update_sync_run(run_id: int, **fields):
 
 
 def finalize_sync_run(
-    conn: sqlite3.Connection,
     run_id: int,
     status: str,
     error_summary: str | None = None,
@@ -736,6 +824,7 @@ def finalize_sync_run(
     images_succeeded: int | None = None,
     images_failed: int | None = None,
 ):
+    conn = get_connection()
     conn.execute(
         """
         UPDATE sync_runs
@@ -758,6 +847,7 @@ def finalize_sync_run(
         ),
     )
     conn.commit()
+    conn.close()
 
 
 def utc_now() -> str:
