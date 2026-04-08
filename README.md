@@ -229,7 +229,7 @@ docker compose run --rm sync
 ```bash
 curl http://localhost:8900/health
 curl http://localhost:8900/api/cats
-curl http://localhost:8901/health
+curl http://localhost:8900/nginx-health
 ```
 
 ### 方式二：直接本機執行 Python
@@ -264,8 +264,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 | Service | Port | 說明 |
 | --- | --- | --- |
-| `api` | `8900 -> 8000` | FastAPI API |
-| `nginx` | `8901 -> 80` | 靜態圖片服務 |
+| `nginx` | `8900 -> 80` | 對外唯一入口，轉發 `/api` 並提供 `/images` |
+| `api` | 無對外 port | FastAPI，僅供 nginx 內部反代 |
 | `sync` | 無對外 port | 手動或排程執行同步 |
 
 ## 部署
@@ -281,7 +281,7 @@ chmod +x deploy.sh
 
 1. 將程式同步到 `./deploy/`
 2. 保留 `backend/data/` 不被覆蓋
-3. 重建 `api` image
+3. 重建 `api` 與 `sync` 使用的 backend image
 4. 啟動或更新 `api` 與 `nginx`
 5. 呼叫 `/health` 驗證服務
 
@@ -297,7 +297,7 @@ chmod +x deploy.sh
 
 ## Cloudflare / CDN 建議
 
-- API 與圖片分不同子網域
+- API 與圖片走同一個對外 origin
 - 圖片路徑可設定 `Cache Everything`
 - API 路徑不建議快取
 - 目前 nginx 已為 `/images/` 設定 7 天快取標頭
@@ -327,7 +327,7 @@ chmod +x deploy.sh
 ## 開發風險與注意事項
 
 - `plan.md` 仍保留初版規劃，部分內容已與目前實作不同，應以程式碼為準
-- `docs/deployment.md` 中的圖片 URL 範例仍是舊格式；實際程式已改為版本化圖片路徑
+- `plan.md` 與部分舊文件仍保留早期規劃，若與目前單一 origin 拓撲不同，應以程式碼為準
 - repo 目前同時存在 `backend/data/` 與 `data/`，前者是 Docker volume 目標，後者偏向本機執行時使用，開發時要避免混淆
 - 目前沒有測試覆蓋，修改同步與 schema 時需要手動驗證
 

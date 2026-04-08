@@ -3,7 +3,7 @@
 本文件描述的是目前 repo 已落地的部署方式，而不是初版規劃稿。現行系統由三個 Docker Compose service 組成：
 
 - `api`: FastAPI API
-- `nginx`: 靜態圖片服務
+- `nginx`: 對外唯一入口，反代 API 並提供靜態圖片
 - `sync`: 手動或排程執行的資料同步工作
 
 ## 部署架構
@@ -57,7 +57,7 @@ chmod +x deploy.sh
    - `flutter_app/`
    - `*.md`
 4. 進入 `./deploy/`
-5. 重建 `api` image
+5. 重建 `api` 與 `sync` 共用的 backend image
 6. 啟動或更新 `api` 與 `nginx`
 7. 呼叫 `http://localhost:8900/health` 做基本驗證
 
@@ -67,7 +67,7 @@ chmod +x deploy.sh
 cd ./deploy
 docker compose ps
 curl http://localhost:8900/health
-curl http://localhost:8901/health
+curl http://localhost:8900/nginx-health
 ```
 
 ## 手動操作
@@ -123,8 +123,7 @@ crontab -e
 
 | Service | Port | 說明 |
 | --- | --- | --- |
-| API | `8900` | FastAPI，對應 `http://localhost:8900` |
-| Images | `8901` | nginx，對應 `http://localhost:8901` |
+| Public entrypoint | `8900` | nginx，對應 `http://localhost:8900` |
 
 ### API / 圖片範例
 
@@ -136,7 +135,7 @@ curl http://localhost:8900/api/cats
 實際圖片路徑格式為：
 
 ```text
-http://localhost:8901/images/{dataset_version}/{animal_id}.png
+http://localhost:8900/images/{dataset_version}/{animal_id}.png
 ```
 
 不是早期文件中的：
@@ -147,19 +146,14 @@ http://localhost:8901/images/{dataset_version}/{animal_id}.png
 
 ## Cloudflare 配置建議
 
-### DNS
+### DNS / Reverse Proxy
 
-1. `cat-api.yourdomain.com` 指向 VM 或反向代理
-2. `cat-images.yourdomain.com` 指向 VM 或反向代理
-
-### Reverse Proxy
-
-- `cat-api.yourdomain.com` -> `localhost:8900`
-- `cat-images.yourdomain.com` -> `localhost:8901`
+- `cat.yourdomain.com` 指向 VM 或反向代理
+- 同一個 origin 下由 nginx 提供 `/api/*`、`/images/*` 與 `/health`
 
 ### Cache
 
-- `cat-images.yourdomain.com/images/*`:
+- `cat.yourdomain.com/images/*`:
   `Cache Everything`
 - Edge TTL:
   7 天
@@ -203,5 +197,5 @@ DATABASE_PATH=/app/data/cats.db
 這份文件已反映目前實作，但仍有幾點值得注意：
 
 - `deploy.sh` 目前不會同步任何 `*.md`，所以更新文件不會自動帶到 `./deploy/`
-- `deploy.sh` 只會 `build --no-cache api`，`sync` 共用同一個 backend image，因此通常會跟著更新；若未來 compose 結構改變，這裡也要一起調整
+- `deploy.sh` 會同時重建 `api` 與 `sync` 使用的 backend image，避免 API 與同步腳本跑不同版本
 - 現在沒有自動化 smoke test，health check 只驗證 API 是否存活，不保證當次同步成功

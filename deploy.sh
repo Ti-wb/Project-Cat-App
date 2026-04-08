@@ -24,7 +24,7 @@ rsync -av --delete \
 
 echo "📦 Building & restarting services..."
 cd "$DEPLOY_DIR"
-docker compose build --no-cache api
+docker compose build --no-cache api sync
 docker compose up -d api nginx
 
 echo "✅ Deploy done!"
