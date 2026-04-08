@@ -318,21 +318,24 @@ def sync():
     IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     init_db()
-
-    conn = get_connection()
-    mark_stale_running_syncs(conn)
-    published_version = get_current_published_version(conn)
-    dataset_version = generate_dataset_version()
-    stage_dir = dataset_image_dir(dataset_version)
-    stage_dir.mkdir(parents=True, exist_ok=True)
-
-    headers = {"User-Agent": USER_AGENT}
-    limiter = RateLimiter({"metadata": METADATA_INTERVAL, "image": IMAGE_INTERVAL})
-    config = SyncConfig()
-    run_id = create_sync_run(conn, dataset_version)
+    conn: sqlite3.Connection | None = None
+    run_id: int | None = None
+    dataset_version: str | None = None
     published_switched = False
 
     try:
+        conn = get_connection()
+        mark_stale_running_syncs(conn)
+        published_version = get_current_published_version(conn)
+        dataset_version = generate_dataset_version()
+        stage_dir = dataset_image_dir(dataset_version)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        headers = {"User-Agent": USER_AGENT}
+        limiter = RateLimiter({"metadata": METADATA_INTERVAL, "image": IMAGE_INTERVAL})
+        config = SyncConfig()
+        run_id = create_sync_run(conn, dataset_version)
+
         with httpx.Client(headers=headers, follow_redirects=False) as client:
             upstream = UpstreamClient(client=client, limiter=limiter, config=config)
             log.info("Fetching data from government API ...")
@@ -398,17 +401,23 @@ def sync():
                 image_stats["failed"],
             )
     except Exception as exc:
-        conn.rollback()
-        if not published_switched:
-            cleanup_dataset_version(conn, dataset_version)
-        finalize_sync_run(
-            run_id,
-            status="failed",
-            error_summary=str(exc),
-        )
+        if conn is not None:
+            conn.rollback()
+        if not published_switched and conn is not None and dataset_version is not None:
+            try:
+                cleanup_dataset_version(conn, dataset_version)
+            except Exception:
+                log.exception("Failed to cleanup dataset version %s after sync error", dataset_version)
+        if run_id is not None:
+            finalize_sync_run(
+                run_id,
+                status="failed",
+                error_summary=str(exc),
+            )
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def stage_cats(
@@ -580,7 +589,7 @@ def can_reuse_published_image(published_row: sqlite3.Row | None, record: dict) -
 
 def should_queue_image_download(published_row: sqlite3.Row | None, row: dict) -> bool:
     source_album_url = row["source_album_url"]
-    if not source_album_url:
+    if not isinstance(source_album_url, str) or not source_album_url:
         return False
     if row["local_image"]:
         return False
@@ -590,6 +599,8 @@ def should_queue_image_download(published_row: sqlite3.Row | None, row: dict) ->
 
 
 def queue_image_fetch(conn: sqlite3.Connection, dataset_version: str, animal_id: int, source_url: str):
+    if not isinstance(source_url, str) or not source_url:
+        return
     source_url_hash = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
     conn.execute(
         """
