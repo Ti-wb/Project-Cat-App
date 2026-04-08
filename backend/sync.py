@@ -250,7 +250,19 @@ def sync():
             log.info("Total records from API: %d", len(records))
 
             counts = upsert_cats(conn, records, run_id)
-            removed_count = record_and_delete_removed_cats(conn, counts["api_ids"], run_id)
+            snapshot_complete = counts["invalid_records"] == 0
+            removed_count = 0
+            run_status = "success"
+            error_summary = None
+            if snapshot_complete:
+                removed_count = record_and_delete_removed_cats(conn, counts["api_ids"], run_id)
+            else:
+                run_status = "partial"
+                error_summary = (
+                    f"Skipped removals because {counts['invalid_records']} upstream records "
+                    "had missing or invalid animal_id values"
+                )
+                log.warning(error_summary)
             counts["deleted"] = removed_count
             update_sync_run(
                 run_id,
@@ -262,7 +274,8 @@ def sync():
             finalize_sync_run(
                 conn,
                 run_id,
-                status="success",
+                status=run_status,
+                error_summary=error_summary,
                 images_attempted=image_stats["attempted"],
                 images_succeeded=image_stats["succeeded"],
                 images_failed=image_stats["failed"],
@@ -287,11 +300,12 @@ def sync():
 def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> dict[str, int | set[int]]:
     now = utc_now()
     api_ids: set[int] = set()
-    added = updated = 0
+    added = updated = invalid_records = 0
 
     for record in records:
         animal_id = _safe_int(record.get("animal_id"))
         if not animal_id:
+            invalid_records += 1
             continue
         api_ids.add(animal_id)
 
@@ -403,13 +417,25 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
             )
             added += 1
 
-        if should_queue_image_refresh(existing, row):
+        if has_removed_image_source(existing, row):
+            conn.execute(
+                "UPDATE cats SET local_image = NULL WHERE animal_id = ?",
+                (animal_id,),
+            )
+            conn.execute("DELETE FROM image_fetch_state WHERE animal_id = ?", (animal_id,))
+        elif should_queue_image_refresh(existing, row):
+            force_reset = should_force_image_refresh(existing, row)
             if should_clear_local_image(existing, row):
                 conn.execute(
                     "UPDATE cats SET local_image = NULL WHERE animal_id = ?",
                     (animal_id,),
                 )
-            queue_image_refresh(conn, animal_id, row["source_album_url"])
+            queue_image_refresh(
+                conn,
+                animal_id,
+                row["source_album_url"],
+                force_reset=force_reset,
+            )
 
     conn.commit()
     update_sync_run(
@@ -417,7 +443,12 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
         records_seen=len(api_ids),
         records_upserted=added + updated,
     )
-    return {"api_ids": api_ids, "added": added, "updated": updated}
+    return {
+        "api_ids": api_ids,
+        "added": added,
+        "updated": updated,
+        "invalid_records": invalid_records,
+    }
 
 
 def should_queue_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
@@ -438,7 +469,12 @@ def should_queue_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
     return False
 
 
-def queue_image_refresh(conn: sqlite3.Connection, animal_id: int, source_url: str):
+def queue_image_refresh(
+    conn: sqlite3.Connection,
+    animal_id: int,
+    source_url: str,
+    force_reset: bool = False,
+):
     source_url_hash = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
     conn.execute(
         """
@@ -449,27 +485,35 @@ def queue_image_refresh(conn: sqlite3.Connection, animal_id: int, source_url: st
         ON CONFLICT(animal_id) DO UPDATE SET
             source_url_hash=excluded.source_url_hash,
             last_success_at=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
                 ELSE image_fetch_state.last_success_at
             END,
             failure_count=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN 0
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN 0
                 ELSE image_fetch_state.failure_count
             END,
             last_error_code=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
                 ELSE image_fetch_state.last_error_code
             END,
             next_eligible_at=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN NULL
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
                 ELSE image_fetch_state.next_eligible_at
             END,
             status=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash THEN 'pending'
+                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN 'pending'
                 ELSE image_fetch_state.status
             END
         """,
-        (animal_id, source_url_hash),
+        (
+            animal_id,
+            source_url_hash,
+            int(force_reset),
+            int(force_reset),
+            int(force_reset),
+            int(force_reset),
+            int(force_reset),
+        ),
     )
 
 
@@ -486,6 +530,25 @@ def should_clear_local_image(existing: sqlite3.Row | None, row: dict) -> bool:
     if existing["source_album_update"] != row["source_album_update"]:
         return True
     return False
+
+
+def should_force_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
+    if existing is None:
+        return False
+    local_image = row["local_image"]
+    if local_image and not (IMAGE_DIR / local_image).exists():
+        return True
+    if existing["album_file"] != row["album_file"]:
+        return True
+    if existing["source_album_update"] != row["source_album_update"]:
+        return True
+    return False
+
+
+def has_removed_image_source(existing: sqlite3.Row | None, row: dict) -> bool:
+    if existing is None:
+        return False
+    return bool(existing["album_file"]) and not row["album_file"]
 
 
 def record_and_delete_removed_cats(conn: sqlite3.Connection, api_ids: set[int], run_id: int) -> int:
