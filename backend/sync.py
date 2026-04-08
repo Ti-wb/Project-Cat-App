@@ -328,6 +328,7 @@ def sync():
     limiter = RateLimiter({"metadata": METADATA_INTERVAL, "image": IMAGE_INTERVAL})
     config = SyncConfig()
     run_id = create_sync_run(conn, dataset_version)
+    published_switched = False
 
     try:
         with httpx.Client(headers=headers, follow_redirects=False) as client:
@@ -373,6 +374,7 @@ def sync():
             )
 
             publish_dataset(conn, dataset_version)
+            published_switched = True
             prune_datasets(conn, keep_versions={dataset_version})
             finalize_sync_run(
                 run_id,
@@ -393,7 +395,8 @@ def sync():
             )
     except Exception as exc:
         conn.rollback()
-        cleanup_dataset_version(conn, dataset_version)
+        if not published_switched:
+            cleanup_dataset_version(conn, dataset_version)
         finalize_sync_run(
             run_id,
             status="failed",
