@@ -1,0 +1,29 @@
+# Data
+backend/data/cats.db
+backend/data/images/*.png
+backend/data/images/*.jpg
+deploy/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment / Secrets
+.env
+*.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+CLAUDE.md
