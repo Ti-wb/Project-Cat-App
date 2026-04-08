@@ -1,5 +1,5 @@
 """
-sync.py - Sync cat data from Taiwan government API to local SQLite database.
+sync.py - Sync cat data from Taiwan government API to a staged dataset version.
 Usage: python sync.py
 """
 import hashlib
@@ -8,20 +8,28 @@ import json
 import logging
 import os
 import random
-import sqlite3
+import shutil
 import socket
+import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from database import DATABASE_PATH, get_connection, init_db
+from database import (
+    DATABASE_PATH,
+    dataset_image_dir,
+    get_connection,
+    get_current_published_version,
+    init_db,
+    set_current_published_version,
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-IMAGE_DIR = Path(os.path.dirname(DATABASE_PATH)) / "images"
+IMAGE_ROOT = Path(os.path.dirname(DATABASE_PATH)) / "images"
 API_BASE = (
     "https://data.moa.gov.tw/Service/OpenData/TransService.aspx"
     "?UnitId=QcbUEzN6E6DL&IsTransData=1&animal_kind=貓"
@@ -35,8 +43,6 @@ METADATA_MAX_ATTEMPTS = 4
 IMAGE_MAX_ATTEMPTS = 3
 METADATA_BACKOFFS = (2.0, 4.0, 8.0)
 IMAGE_BACKOFFS = (2.0, 5.0)
-IMAGE_FAILURE_COOLDOWN = 6 * 60 * 60
-MAX_IMAGES_PER_RUN = 200
 MAX_IMAGE_REDIRECTS = 3
 DEFAULT_ALLOWED_IMAGE_HOSTS = ("data.moa.gov.tw", "www.pet.gov.tw", "asms.coa.gov.tw")
 DENIED_IP_NETWORKS = (
@@ -59,8 +65,6 @@ class SyncConfig:
     metadata_max_attempts: int = METADATA_MAX_ATTEMPTS
     image_max_attempts: int = IMAGE_MAX_ATTEMPTS
     request_timeout: int = REQUEST_TIMEOUT
-    image_failure_cooldown: int = IMAGE_FAILURE_COOLDOWN
-    max_images_per_run: int = MAX_IMAGES_PER_RUN
     max_image_redirects: int = MAX_IMAGE_REDIRECTS
 
 
@@ -272,9 +276,8 @@ class UpstreamClient:
         except socket.gaierror as exc:
             raise UnsafeImageUrlError("HOST_RESOLUTION_FAILED") from exc
 
-        for family, _, _, _, sockaddr in addrinfos:
-            raw_ip = sockaddr[0]
-            ip = ipaddress.ip_address(raw_ip)
+        for _, _, _, _, sockaddr in addrinfos:
+            ip = ipaddress.ip_address(sockaddr[0])
             if (
                 ip.is_private
                 or ip.is_loopback
@@ -311,15 +314,20 @@ def fetch_all_cats(upstream: UpstreamClient, run_id: int) -> list[dict]:
 
 
 def sync():
-    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGE_ROOT.mkdir(parents=True, exist_ok=True)
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
     init_db()
 
     conn = get_connection()
+    published_version = get_current_published_version(conn)
+    dataset_version = generate_dataset_version()
+    stage_dir = dataset_image_dir(dataset_version)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
     headers = {"User-Agent": USER_AGENT}
     limiter = RateLimiter({"metadata": METADATA_INTERVAL, "image": IMAGE_INTERVAL})
     config = SyncConfig()
-    run_id = create_sync_run(conn)
+    run_id = create_sync_run(conn, dataset_version)
 
     try:
         with httpx.Client(headers=headers, follow_redirects=False) as client:
@@ -328,48 +336,64 @@ def sync():
             records = fetch_all_cats(upstream, run_id)
             log.info("Total records from API: %d", len(records))
 
-            counts = upsert_cats(conn, records, run_id)
-            snapshot_complete = counts["invalid_records"] == 0
-            removed_count = 0
-            run_status = "success"
-            error_summary = None
-            if snapshot_complete:
-                removed_count = record_and_delete_removed_cats(conn, counts["api_ids"], run_id)
-            else:
-                run_status = "partial"
+            counts = stage_cats(conn, records, run_id, dataset_version, published_version)
+            if counts["invalid_records"] > 0:
                 error_summary = (
-                    f"Skipped removals because {counts['invalid_records']} upstream records "
+                    f"Skipped publish because {counts['invalid_records']} upstream records "
                     "had missing or invalid animal_id values"
                 )
                 log.warning(error_summary)
-            counts["deleted"] = removed_count
+                finalize_sync_run(
+                    run_id,
+                    status="partial",
+                    error_summary=error_summary,
+                )
+                cleanup_dataset_version(conn, dataset_version)
+                return
+
+            removed_count = record_removed_cats(
+                conn,
+                dataset_version,
+                published_version,
+                counts["api_ids"],
+                run_id,
+            )
             update_sync_run(
                 run_id,
                 records_upserted=counts["added"] + counts["updated"],
                 records_removed=removed_count,
             )
 
-            image_stats = sync_images(conn, upstream, config, run_id)
+            image_stats = sync_images(
+                conn,
+                upstream,
+                dataset_version,
+                published_version,
+                run_id,
+            )
+
+            publish_dataset(conn, dataset_version)
+            prune_datasets(conn, keep_versions={dataset_version})
             finalize_sync_run(
                 run_id,
-                status=run_status,
-                error_summary=error_summary,
+                status="success",
                 images_attempted=image_stats["attempted"],
                 images_succeeded=image_stats["succeeded"],
                 images_failed=image_stats["failed"],
             )
 
             log.info(
-                "Sync complete — added: %d, updated: %d, deleted: %d, images attempted: %d, images downloaded: %d, image failures: %d",
+                "Sync complete — added: %d, updated: %d, removed: %d, images attempted: %d, images downloaded: %d, image fallbacks/missing: %d",
                 counts["added"],
                 counts["updated"],
-                counts["deleted"],
+                removed_count,
                 image_stats["attempted"],
                 image_stats["succeeded"],
                 image_stats["failed"],
             )
     except Exception as exc:
         conn.rollback()
+        cleanup_dataset_version(conn, dataset_version)
         finalize_sync_run(
             run_id,
             status="failed",
@@ -380,7 +404,13 @@ def sync():
         conn.close()
 
 
-def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> dict[str, int | set[int]]:
+def stage_cats(
+    conn: sqlite3.Connection,
+    records: list[dict],
+    run_id: int,
+    dataset_version: str,
+    published_version: str | None,
+) -> dict[str, int | set[int]]:
     now = utc_now()
     api_ids: set[int] = set()
     added = updated = invalid_records = 0
@@ -392,7 +422,13 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
             continue
         api_ids.add(animal_id)
 
+        published_row = get_published_cat(conn, published_version, animal_id)
+        local_image = None
+        if can_reuse_published_image(published_row, record):
+            local_image = copy_published_image(conn, published_version, animal_id, dataset_version)
+
         row = {
+            "dataset_version": dataset_version,
             "animal_id": animal_id,
             "animal_subid": record.get("animal_subid"),
             "animal_place": record.get("animal_place"),
@@ -414,119 +450,51 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
             "shelter_address": record.get("shelter_address"),
             "shelter_tel": record.get("shelter_tel"),
             "album_file": record.get("album_file"),
+            "local_image": local_image,
             "source_album_url": record.get("album_file"),
             "source_animal_update": record.get("animal_update"),
             "source_album_update": record.get("album_update"),
             "area_pkid": _safe_int(record.get("animal_area_pkid")),
             "shelter_pkid": _safe_int(record.get("animal_shelter_pkid")),
             "synced_at": now,
+            "first_seen_at": (
+                published_row["first_seen_at"] if published_row and published_row["first_seen_at"] else now
+            ),
             "last_seen_at": now,
         }
 
-        existing = conn.execute(
+        conn.execute(
             """
-            SELECT
-                c.animal_id,
-                c.local_image,
-                c.first_seen_at,
-                c.album_file,
-                c.source_album_update,
-                s.status AS image_status
-            FROM cats c
-            LEFT JOIN image_fetch_state s ON s.animal_id = c.animal_id
-            WHERE c.animal_id = ?
-            """,
-            (animal_id,),
-        ).fetchone()
-
-        if existing:
-            row["local_image"] = existing["local_image"]
-            row["first_seen_at"] = existing["first_seen_at"] or now
-            conn.execute(
-                """
-                UPDATE cats SET
-                    animal_subid=:animal_subid,
-                    animal_place=:animal_place,
-                    animal_variety=:animal_variety,
-                    animal_sex=:animal_sex,
-                    animal_bodytype=:animal_bodytype,
-                    animal_colour=:animal_colour,
-                    animal_age=:animal_age,
-                    animal_sterilization=:animal_sterilization,
-                    animal_bacterin=:animal_bacterin,
-                    animal_foundplace=:animal_foundplace,
-                    animal_status=:animal_status,
-                    animal_remark=:animal_remark,
-                    animal_opendate=:animal_opendate,
-                    animal_closeddate=:animal_closeddate,
-                    animal_update=:animal_update,
-                    animal_createtime=:animal_createtime,
-                    shelter_name=:shelter_name,
-                    shelter_address=:shelter_address,
-                    shelter_tel=:shelter_tel,
-                    album_file=:album_file,
-                    local_image=:local_image,
-                    source_album_url=:source_album_url,
-                    source_animal_update=:source_animal_update,
-                    source_album_update=:source_album_update,
-                    area_pkid=:area_pkid,
-                    shelter_pkid=:shelter_pkid,
-                    synced_at=:synced_at,
-                    first_seen_at=:first_seen_at,
-                    last_seen_at=:last_seen_at
-                WHERE animal_id=:animal_id
-                """,
-                row,
+            INSERT INTO dataset_cats (
+                dataset_version, animal_id, animal_subid, animal_place, animal_variety,
+                animal_sex, animal_bodytype, animal_colour, animal_age,
+                animal_sterilization, animal_bacterin, animal_foundplace,
+                animal_status, animal_remark, animal_opendate, animal_closeddate,
+                animal_update, animal_createtime, shelter_name, shelter_address,
+                shelter_tel, album_file, local_image, source_album_url,
+                source_animal_update, source_album_update, area_pkid, shelter_pkid,
+                synced_at, first_seen_at, last_seen_at
+            ) VALUES (
+                :dataset_version, :animal_id, :animal_subid, :animal_place, :animal_variety,
+                :animal_sex, :animal_bodytype, :animal_colour, :animal_age,
+                :animal_sterilization, :animal_bacterin, :animal_foundplace,
+                :animal_status, :animal_remark, :animal_opendate, :animal_closeddate,
+                :animal_update, :animal_createtime, :shelter_name, :shelter_address,
+                :shelter_tel, :album_file, :local_image, :source_album_url,
+                :source_animal_update, :source_album_update, :area_pkid, :shelter_pkid,
+                :synced_at, :first_seen_at, :last_seen_at
             )
+            """,
+            row,
+        )
+
+        if published_row:
             updated += 1
         else:
-            row["local_image"] = None
-            row["first_seen_at"] = now
-            conn.execute(
-                """
-                INSERT INTO cats (
-                    animal_id, animal_subid, animal_place, animal_variety,
-                    animal_sex, animal_bodytype, animal_colour, animal_age,
-                    animal_sterilization, animal_bacterin, animal_foundplace,
-                    animal_status, animal_remark, animal_opendate, animal_closeddate,
-                    animal_update, animal_createtime, shelter_name, shelter_address,
-                    shelter_tel, album_file, local_image, source_album_url,
-                    source_animal_update, source_album_update, area_pkid, shelter_pkid,
-                    synced_at, first_seen_at, last_seen_at
-                ) VALUES (
-                    :animal_id, :animal_subid, :animal_place, :animal_variety,
-                    :animal_sex, :animal_bodytype, :animal_colour, :animal_age,
-                    :animal_sterilization, :animal_bacterin, :animal_foundplace,
-                    :animal_status, :animal_remark, :animal_opendate, :animal_closeddate,
-                    :animal_update, :animal_createtime, :shelter_name, :shelter_address,
-                    :shelter_tel, :album_file, :local_image, :source_album_url,
-                    :source_animal_update, :source_album_update, :area_pkid, :shelter_pkid,
-                    :synced_at, :first_seen_at, :last_seen_at
-                )
-                """,
-                row,
-            )
             added += 1
 
-        if has_removed_image_source(existing, row):
-            conn.execute(
-                "UPDATE cats SET local_image = NULL WHERE animal_id = ?",
-                (animal_id,),
-            )
-            conn.execute("DELETE FROM image_fetch_state WHERE animal_id = ?", (animal_id,))
-        elif should_queue_image_refresh(existing, row):
-            force_reset = should_force_image_refresh(existing, row)
-            if should_clear_local_image(existing, row):
-                conn.execute(
-                    "UPDATE cats SET local_image = NULL WHERE animal_id = ?",
-                    (animal_id,),
-                )
-            queue_image_refresh(
-                conn,
-                animal_id,
-                row["source_album_url"],
-                force_reset=force_reset,
-            )
+        if should_queue_image_download(published_row, row):
+            queue_image_fetch(conn, dataset_version, animal_id, row["source_album_url"])
 
     conn.commit()
     update_sync_run(
@@ -542,111 +510,71 @@ def upsert_cats(conn: sqlite3.Connection, records: list[dict], run_id: int) -> d
     }
 
 
-def should_queue_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
-    source_url = row["source_album_url"]
-    if not source_url:
+def get_published_cat(
+    conn: sqlite3.Connection, published_version: str | None, animal_id: int
+) -> sqlite3.Row | None:
+    if not published_version:
+        return None
+    return conn.execute(
+        """
+        SELECT *
+        FROM dataset_cats
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (published_version, animal_id),
+    ).fetchone()
+
+
+def can_reuse_published_image(published_row: sqlite3.Row | None, record: dict) -> bool:
+    if not published_row or not published_row["local_image"]:
         return False
-    local_image = row["local_image"]
-    if not local_image:
-        return True
-    if not (IMAGE_DIR / local_image).exists():
-        return True
-    if existing is None:
-        return True
-    if existing["album_file"] != row["album_file"]:
-        return True
-    if existing["source_album_update"] != row["source_album_update"]:
-        return True
-    return False
+    source_album_url = record.get("album_file")
+    if not source_album_url:
+        return False
+    if published_row["album_file"] != source_album_url:
+        return False
+    if published_row["source_album_update"] != record.get("album_update"):
+        return False
+    return published_image_path(str(published_row["dataset_version"]), published_row["local_image"]).exists()
 
 
-def queue_image_refresh(
-    conn: sqlite3.Connection,
-    animal_id: int,
-    source_url: str,
-    force_reset: bool = False,
-):
+def should_queue_image_download(published_row: sqlite3.Row | None, row: dict) -> bool:
+    source_album_url = row["source_album_url"]
+    if not source_album_url:
+        return False
+    if row["local_image"]:
+        return False
+    if not published_row:
+        return True
+    return True
+
+
+def queue_image_fetch(conn: sqlite3.Connection, dataset_version: str, animal_id: int, source_url: str):
     source_url_hash = hashlib.sha256(source_url.encode("utf-8")).hexdigest()
     conn.execute(
         """
-        INSERT INTO image_fetch_state (
-            animal_id, source_url_hash, last_attempt_at, last_success_at,
-            failure_count, last_error_code, next_eligible_at, status
-        ) VALUES (?, ?, NULL, NULL, 0, NULL, NULL, 'pending')
-        ON CONFLICT(animal_id) DO UPDATE SET
-            source_url_hash=excluded.source_url_hash,
-            last_success_at=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
-                ELSE image_fetch_state.last_success_at
-            END,
-            failure_count=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN 0
-                ELSE image_fetch_state.failure_count
-            END,
-            last_error_code=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
-                ELSE image_fetch_state.last_error_code
-            END,
-            next_eligible_at=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN NULL
-                ELSE image_fetch_state.next_eligible_at
-            END,
-            status=CASE
-                WHEN image_fetch_state.source_url_hash != excluded.source_url_hash OR ? THEN 'pending'
-                ELSE image_fetch_state.status
-            END
+        INSERT INTO dataset_image_fetch_state (
+            dataset_version, animal_id, source_url_hash, last_attempt_at, last_success_at,
+            failure_count, last_error_code, status
+        ) VALUES (?, ?, ?, NULL, NULL, 0, NULL, 'pending')
         """,
-        (
-            animal_id,
-            source_url_hash,
-            int(force_reset),
-            int(force_reset),
-            int(force_reset),
-            int(force_reset),
-            int(force_reset),
-        ),
+        (dataset_version, animal_id, source_url_hash),
     )
 
 
-def should_clear_local_image(existing: sqlite3.Row | None, row: dict) -> bool:
-    if existing is None:
-        return True
-    local_image = row["local_image"]
-    if not local_image:
-        return False
-    if not (IMAGE_DIR / local_image).exists():
-        return True
-    if existing["album_file"] != row["album_file"]:
-        return True
-    if existing["source_album_update"] != row["source_album_update"]:
-        return True
-    return False
+def record_removed_cats(
+    conn: sqlite3.Connection,
+    dataset_version: str,
+    published_version: str | None,
+    api_ids: set[int],
+    run_id: int,
+) -> int:
+    if not published_version:
+        return 0
 
-
-def should_force_image_refresh(existing: sqlite3.Row | None, row: dict) -> bool:
-    if existing is None:
-        return False
-    local_image = row["local_image"]
-    if not local_image and existing["image_status"] == "success":
-        return True
-    if local_image and not (IMAGE_DIR / local_image).exists():
-        return True
-    if existing["album_file"] != row["album_file"]:
-        return True
-    if existing["source_album_update"] != row["source_album_update"]:
-        return True
-    return False
-
-
-def has_removed_image_source(existing: sqlite3.Row | None, row: dict) -> bool:
-    if existing is None:
-        return False
-    return bool(existing["album_file"]) and not row["album_file"]
-
-
-def record_and_delete_removed_cats(conn: sqlite3.Connection, api_ids: set[int], run_id: int) -> int:
     existing_rows = conn.execute(
-        "SELECT * FROM cats"
+        "SELECT * FROM dataset_cats WHERE dataset_version = ?",
+        (published_version,),
     ).fetchall()
     removed_rows = [row for row in existing_rows if row["animal_id"] not in api_ids]
     if not removed_rows:
@@ -655,6 +583,7 @@ def record_and_delete_removed_cats(conn: sqlite3.Connection, api_ids: set[int], 
     removed_at = utc_now()
     for row in removed_rows:
         snapshot = dict(row)
+        snapshot["replacement_dataset_version"] = dataset_version
         conn.execute(
             """
             INSERT INTO cat_removals (
@@ -675,106 +604,93 @@ def record_and_delete_removed_cats(conn: sqlite3.Connection, api_ids: set[int], 
                 "missing_from_upstream_snapshot",
             ),
         )
-        local_image = row["local_image"]
-        if local_image:
-            img_path = IMAGE_DIR / local_image
-            if img_path.exists():
-                img_path.unlink()
-        conn.execute("DELETE FROM image_fetch_state WHERE animal_id = ?", (row["animal_id"],))
-        conn.execute("DELETE FROM cats WHERE animal_id = ?", (row["animal_id"],))
 
     conn.commit()
-    log.info("Deleted %d removed animals from DB and recorded history", len(removed_rows))
+    log.info("Recorded %d removed animals for new dataset %s", len(removed_rows), dataset_version)
     return len(removed_rows)
 
 
 def sync_images(
     conn: sqlite3.Connection,
     upstream: UpstreamClient,
-    config: SyncConfig,
+    dataset_version: str,
+    published_version: str | None,
     run_id: int,
 ) -> dict[str, int]:
-    eligible_rows = conn.execute(
+    queued_rows = conn.execute(
         """
-        SELECT c.animal_id, c.source_album_url, c.local_image, s.failure_count
-        FROM cats c
-        JOIN image_fetch_state s ON s.animal_id = c.animal_id
-        WHERE c.source_album_url IS NOT NULL
-          AND c.source_album_url != ''
-          AND s.status IN ('pending', 'cooldown')
-          AND (s.next_eligible_at IS NULL OR s.next_eligible_at <= ?)
+        SELECT c.animal_id, c.source_album_url
+        FROM dataset_cats c
+        JOIN dataset_image_fetch_state s
+          ON s.dataset_version = c.dataset_version
+         AND s.animal_id = c.animal_id
+        WHERE c.dataset_version = ?
+          AND s.status = 'pending'
         ORDER BY c.animal_id
-        LIMIT ?
         """,
-        (utc_now(), config.max_images_per_run),
+        (dataset_version,),
     ).fetchall()
 
-    log.info("Images to download this run: %d", len(eligible_rows))
+    log.info("Images to resolve for dataset %s: %d", dataset_version, len(queued_rows))
     attempted = succeeded = failed = 0
 
-    for row in eligible_rows:
+    for row in queued_rows:
         attempted += 1
         animal_id = row["animal_id"]
-        image_url = row["source_album_url"]
-        result = upstream.download_image(image_url)
+        result = upstream.download_image(row["source_album_url"])
         attempted_at = utc_now()
 
         conn.execute(
             """
-            UPDATE image_fetch_state
-            SET last_attempt_at = ?
-            WHERE animal_id = ?
+            UPDATE dataset_image_fetch_state
+            SET last_attempt_at = ?, failure_count = failure_count + 1, last_error_code = ?
+            WHERE dataset_version = ? AND animal_id = ?
             """,
-            (attempted_at, animal_id),
+            (
+                attempted_at,
+                result.error_code,
+                dataset_version,
+                animal_id,
+            ),
         )
 
         if result.outcome == "success" and result.content is not None:
-            dest = IMAGE_DIR / f"{animal_id}.png"
-            dest.write_bytes(result.content)
+            write_dataset_image(dataset_version, animal_id, result.content)
             conn.execute(
-                "UPDATE cats SET local_image = ? WHERE animal_id = ?",
-                (dest.name, animal_id),
+                """
+                UPDATE dataset_cats
+                SET local_image = ?
+                WHERE dataset_version = ? AND animal_id = ?
+                """,
+                (image_filename(animal_id), dataset_version, animal_id),
             )
             conn.execute(
                 """
-                UPDATE image_fetch_state
-                SET last_success_at = ?,
-                    failure_count = 0,
-                    last_error_code = NULL,
-                    next_eligible_at = NULL,
-                    status = 'success'
-                WHERE animal_id = ?
+                UPDATE dataset_image_fetch_state
+                SET last_success_at = ?, failure_count = 0, last_error_code = NULL, status = 'success'
+                WHERE dataset_version = ? AND animal_id = ?
                 """,
-                (attempted_at, animal_id),
+                (attempted_at, dataset_version, animal_id),
             )
             succeeded += 1
-        elif result.outcome == "terminal_failure":
-            conn.execute(
-                """
-                UPDATE image_fetch_state
-                SET failure_count = failure_count + 1,
-                    last_error_code = ?,
-                    next_eligible_at = NULL,
-                    status = 'terminal_failure'
-                WHERE animal_id = ?
-                """,
-                (result.error_code, animal_id),
-            )
-            failed += 1
         else:
-            next_eligible_at = (
-                datetime.now(timezone.utc) + timedelta(seconds=config.image_failure_cooldown)
-            ).isoformat()
+            reused = copy_published_image(conn, published_version, animal_id, dataset_version)
+            status = "reused" if reused else "missing"
             conn.execute(
                 """
-                UPDATE image_fetch_state
-                SET failure_count = failure_count + 1,
-                    last_error_code = ?,
-                    next_eligible_at = ?,
-                    status = 'cooldown'
-                WHERE animal_id = ?
+                UPDATE dataset_cats
+                SET local_image = ?
+                WHERE dataset_version = ? AND animal_id = ?
                 """,
-                (result.error_code, next_eligible_at, animal_id),
+                (reused, dataset_version, animal_id),
+            )
+            conn.execute(
+                """
+                UPDATE dataset_image_fetch_state
+                SET status = ?
+                WHERE dataset_version = ? AND animal_id = ?
+                """,
+                (status, dataset_version, animal_id),
             )
             failed += 1
 
@@ -797,13 +713,100 @@ def sync_images(
     return {"attempted": attempted, "succeeded": succeeded, "failed": failed}
 
 
-def create_sync_run(conn: sqlite3.Connection) -> int:
+def publish_dataset(conn: sqlite3.Connection, dataset_version: str):
+    set_current_published_version(conn, dataset_version)
+    conn.commit()
+
+
+def prune_datasets(conn: sqlite3.Connection, keep_versions: set[str]):
+    versions = {
+        row["dataset_version"]
+        for row in conn.execute("SELECT DISTINCT dataset_version FROM dataset_cats").fetchall()
+    }
+    versions.update(
+        row["dataset_version"]
+        for row in conn.execute(
+            "SELECT DISTINCT dataset_version FROM dataset_image_fetch_state"
+        ).fetchall()
+    )
+
+    prune_versions = versions - keep_versions
+    if not prune_versions:
+        return
+
+    for dataset_version in prune_versions:
+        cleanup_dataset_version(conn, dataset_version)
+
+
+def cleanup_dataset_version(conn: sqlite3.Connection, dataset_version: str):
+    conn.execute(
+        "DELETE FROM dataset_image_fetch_state WHERE dataset_version = ?",
+        (dataset_version,),
+    )
+    conn.execute(
+        "DELETE FROM dataset_cats WHERE dataset_version = ?",
+        (dataset_version,),
+    )
+    conn.commit()
+
+    image_dir = dataset_image_dir(dataset_version)
+    if image_dir.exists():
+        shutil.rmtree(image_dir)
+
+
+def copy_published_image(
+    conn: sqlite3.Connection,
+    published_version: str | None,
+    animal_id: int,
+    target_version: str,
+) -> str | None:
+    if not published_version:
+        return None
+
+    row = conn.execute(
+        """
+        SELECT local_image
+        FROM dataset_cats
+        WHERE dataset_version = ? AND animal_id = ?
+        """,
+        (published_version, animal_id),
+    ).fetchone()
+    if not row or not row["local_image"]:
+        return None
+
+    src = published_image_path(published_version, row["local_image"])
+    if not src.exists():
+        return None
+
+    dest_dir = dataset_image_dir(target_version)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / row["local_image"]
+    if src != dest and not dest.exists():
+        shutil.copyfile(src, dest)
+    return row["local_image"]
+
+
+def published_image_path(dataset_version: str, local_image: str) -> Path:
+    return dataset_image_dir(dataset_version) / local_image
+
+
+def image_filename(animal_id: int) -> str:
+    return f"{animal_id}.png"
+
+
+def write_dataset_image(dataset_version: str, animal_id: int, content: bytes):
+    dest_dir = dataset_image_dir(dataset_version)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    (dest_dir / image_filename(animal_id)).write_bytes(content)
+
+
+def create_sync_run(conn: sqlite3.Connection, dataset_version: str) -> int:
     cursor = conn.execute(
         """
-        INSERT INTO sync_runs (started_at, phase, status)
-        VALUES (?, 'full', 'running')
+        INSERT INTO sync_runs (dataset_version, started_at, phase, status)
+        VALUES (?, ?, 'full', 'running')
         """,
-        (utc_now(),),
+        (dataset_version, utc_now()),
     )
     conn.commit()
     return int(cursor.lastrowid)
@@ -852,6 +855,10 @@ def finalize_sync_run(
     )
     conn.commit()
     conn.close()
+
+
+def generate_dataset_version() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def utc_now() -> str:
