@@ -243,10 +243,14 @@ class UpstreamClient:
             raise UnsafeImageUrlError("INVALID_URL_SCHEME")
         if not parsed.hostname:
             raise UnsafeImageUrlError("MISSING_URL_HOST")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise UnsafeImageUrlError("INVALID_URL_PORT") from exc
         hostname = parsed.hostname.rstrip(".").lower()
         if not self._is_allowed_image_host(hostname):
             raise UnsafeImageUrlError("DISALLOWED_IMAGE_HOST")
-        self._ensure_public_host(hostname, parsed.port, parsed.scheme)
+        self._ensure_public_host(hostname, port, parsed.scheme)
         return parsed.geturl()
 
     @staticmethod
