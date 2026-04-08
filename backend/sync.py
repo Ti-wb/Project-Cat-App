@@ -433,7 +433,7 @@ def stage_cats(
 
     for record in records:
         animal_id = _safe_int(record.get("animal_id"))
-        if not animal_id:
+        if animal_id is None:
             invalid_records += 1
             continue
         api_ids.add(animal_id)
@@ -512,7 +512,7 @@ def stage_cats(
         else:
             added += 1
 
-        if should_queue_image_download(published_row, row):
+        if row["source_album_url"] and not row["local_image"]:
             queue_image_fetch(conn, dataset_version, animal_id, row["source_album_url"])
 
     conn.commit()
@@ -585,17 +585,6 @@ def can_reuse_published_image(published_row: sqlite3.Row | None, record: dict) -
     if published_row["source_album_update"] != record.get("album_update"):
         return False
     return published_image_path(str(published_row["dataset_version"]), published_row["local_image"]).exists()
-
-
-def should_queue_image_download(published_row: sqlite3.Row | None, row: dict) -> bool:
-    source_album_url = row["source_album_url"]
-    if not isinstance(source_album_url, str) or not source_album_url:
-        return False
-    if row["local_image"]:
-        return False
-    if not published_row:
-        return True
-    return True
 
 
 def queue_image_fetch(conn: sqlite3.Connection, dataset_version: str, animal_id: int, source_url: str):
