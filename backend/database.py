@@ -26,17 +26,7 @@ def get_current_published_version(conn: sqlite3.Connection) -> str | None:
     ).fetchone()
     if row and row["value"]:
         return str(row["value"])
-
-    row = conn.execute(
-        """
-        SELECT dataset_version
-        FROM dataset_cats
-        GROUP BY dataset_version
-        ORDER BY MAX(synced_at) DESC, dataset_version DESC
-        LIMIT 1
-        """
-    ).fetchone()
-    return str(row["dataset_version"]) if row else None
+    return None
 
 
 def set_current_published_version(conn: sqlite3.Connection, dataset_version: str):
@@ -216,23 +206,6 @@ def init_db():
 
 def _bootstrap_published_dataset(conn: sqlite3.Connection):
     if get_current_published_version(conn):
-        return
-
-    existing_dataset_rows = conn.execute(
-        "SELECT COUNT(*) AS count FROM dataset_cats"
-    ).fetchone()
-    if existing_dataset_rows and existing_dataset_rows["count"] > 0:
-        latest_version = conn.execute(
-            """
-            SELECT dataset_version
-            FROM dataset_cats
-            GROUP BY dataset_version
-            ORDER BY MAX(synced_at) DESC, dataset_version DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        if latest_version:
-            set_current_published_version(conn, str(latest_version["dataset_version"]))
         return
 
     legacy_rows = conn.execute("SELECT * FROM cats").fetchall()

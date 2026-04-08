@@ -766,7 +766,19 @@ def prune_datasets(conn: sqlite3.Connection, keep_versions: set[str]):
         ).fetchall()
     )
 
-    prune_versions = versions - keep_versions
+    active_versions = {
+        row["dataset_version"]
+        for row in conn.execute(
+            """
+            SELECT DISTINCT dataset_version
+            FROM sync_runs
+            WHERE status = 'running'
+              AND dataset_version IS NOT NULL
+            """
+        ).fetchall()
+    }
+
+    prune_versions = versions - keep_versions - active_versions
     if not prune_versions:
         return
 
@@ -894,7 +906,7 @@ def finalize_sync_run(
 
 
 def generate_dataset_version() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
 def utc_now() -> str:
