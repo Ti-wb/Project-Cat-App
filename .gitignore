@@ -5,6 +5,7 @@ backend/data/cats.db
 backend/data/images/*.png
 backend/data/images/*.jpg
 deploy/
+*.bootstrapped
 
 # Python
 __pycache__/
