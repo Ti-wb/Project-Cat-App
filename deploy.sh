@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DIR="$SCRIPT_DIR/deploy"
+PUBLIC_PORT="${PUBLIC_PORT:-8900}"
 
 echo "🚀 Deploying Cat App..."
 
@@ -12,6 +13,8 @@ mkdir -p "$DEPLOY_DIR"
 # 同步程式碼（排除資料目錄與 git 相關）
 rsync -av --delete \
   --exclude='backend/data/' \
+  --exclude='data/' \
+  --exclude='deploy/' \
   --exclude='.git/' \
   --exclude='__pycache__/' \
   --exclude='*.pyc' \
@@ -24,13 +27,13 @@ rsync -av --delete \
 
 echo "📦 Building & restarting services..."
 cd "$DEPLOY_DIR"
-docker compose build --no-cache api sync
-docker compose up -d api nginx
+PUBLIC_PORT="$PUBLIC_PORT" docker compose build --no-cache api sync
+PUBLIC_PORT="$PUBLIC_PORT" docker compose up -d api nginx
 
 echo "✅ Deploy done!"
 echo ""
 
-HEALTH_URL="http://localhost:8900/health"
+HEALTH_URL="http://localhost:${PUBLIC_PORT}/health"
 HEALTH_TIMEOUT_SECONDS=30
 HEALTH_BACKOFF_SECONDS=1
 HEALTH_MAX_BACKOFF_SECONDS=5
